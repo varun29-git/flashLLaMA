@@ -42,7 +42,7 @@
 # MODEL SIZE 
 # ============================================================
 
-D_MODEL = 1024
+D_MODEL = 512
 N_LAYERS = 12
 N_Q_HEADS = 8
 N_KV_HEADS = 2
@@ -55,7 +55,7 @@ DROPOUT = 0.1
 
 SEQ_LEN = 512
 BATCH_SIZE = 8       # micro-batch
-GRAD_ACCUM_STEPS = 8   # effective batch = 64
+GRAD_ACCUM_STEPS = 16   # effective batch = 64
 
 # ============================================================
 # TRAINING SCHEDULE 

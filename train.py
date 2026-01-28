@@ -1,21 +1,21 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from pathlib import Path
 import warnings
 import time
 import math
-
-import tiktoken
+from collections import deque
 
 from config import *
 from model import build_llama
 from dataset import StreamingLanguageModelDataset
 
 
-# ============================================================
-# Model builder
-# ============================================================
+# --------------------------------------------------
+# Model
+# --------------------------------------------------
 def get_model(vocab_size):
     return build_llama(
         vocab_size=vocab_size,
@@ -28,26 +28,6 @@ def get_model(vocab_size):
     )
 
 
-# ============================================================
-# Simple text sampling (sanity check)
-# ============================================================
-@torch.no_grad()
-def sample_text(model, tokenizer, device, prompt, max_new_tokens=80):
-    model.eval()
-    ids = tokenizer.encode(prompt)
-    x = torch.tensor(ids, device=device).unsqueeze(0)
-
-    for _ in range(max_new_tokens):
-        logits = model(x)
-        next_token = torch.argmax(logits[:, -1], dim=-1, keepdim=True)
-        x = torch.cat([x, next_token], dim=1)
-
-    return tokenizer.decode(x[0].tolist())
-
-
-# ============================================================
-# One epoch of training (NO tqdm, stable)
-# ============================================================
 def train_one_epoch(
     model,
     dataloader,
@@ -58,13 +38,24 @@ def train_one_epoch(
     epoch,
     global_step,
     total_steps,
-    token_counter,
     run_start_time,
 ):
     model.train()
-    epoch_start_time = time.time()
 
-    for step, batch in enumerate(dataloader):
+    # Rolling stats
+    loss_window = deque(maxlen=50)
+    epoch_start_time = time.time()
+    tokens_seen = 0
+
+    pbar = tqdm(
+        dataloader,
+        total=STEPS_PER_EPOCH,
+        desc=f"Epoch {epoch+1}/{EPOCHS}",
+        dynamic_ncols=True,
+        leave=True
+    )
+
+    for step, batch in enumerate(pbar):
         if step >= STEPS_PER_EPOCH:
             break
 
@@ -85,57 +76,37 @@ def train_one_epoch(
         optimizer.step()
         scheduler.step()
 
-        # ---- accounting ----
-        batch_tokens = input_ids.numel()
-        token_counter[0] += batch_tokens
+        # ---- stats ----
+        loss_window.append(loss.item())
+        tokens_seen += input_ids.numel()
         global_step += 1
 
-        # ---- logging ----
-        if global_step % LOG_INTERVAL == 0 or global_step == 1:
-            elapsed = time.time() - run_start_time
-            tok_per_sec = token_counter[0] / max(elapsed, 1e-6)
+        elapsed = time.time() - epoch_start_time
+        run_elapsed = time.time() - run_start_time
 
-            progress = global_step / total_steps
-            percent = progress * 100
+        tok_per_sec = tokens_seen / max(elapsed, 1e-6)
+        avg_loss = sum(loss_window) / len(loss_window)
+        lr = scheduler.get_last_lr()[0]
 
-            steps_left = total_steps - global_step
-            eta_seconds = steps_left * (elapsed / max(global_step, 1))
-            eta_hours = eta_seconds / 3600
+        steps_left = total_steps - global_step
+        eta_seconds = steps_left * (run_elapsed / max(global_step, 1))
+        eta_hours = eta_seconds / 3600
 
-            lr = scheduler.get_last_lr()[0]
-
-            print(
-                f"[epoch {epoch+1}/{EPOCHS}] "
-                f"{percent:6.2f}% | "
-                f"step {global_step}/{total_steps} | "
-                f"loss={loss.item():.4f} | "
-                f"lr={lr:.2e} | "
-                f"tok/s={tok_per_sec/1000:.2f}k | "
-                f"ETA={eta_hours:.2f}h"
-            )
+        pbar.set_postfix({
+            "loss": f"{avg_loss:6.3f}",
+            "lr": f"{lr:.2e}",
+            "tok/s": f"{tok_per_sec/1000:.1f}k",
+            "ETA(h)": f"{eta_hours:5.2f}"
+        })
 
     return global_step
 
 
-# ============================================================
-# Main training entry
-# ============================================================
 def train(iterable_ds):
-    # --------------------
-    # Device
-    # --------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nUsing device: {device}\n")
+    print(f"Using device: {device}")
 
     Path(MODEL_FOLDER).mkdir(parents=True, exist_ok=True)
-
-    # --------------------
-    # Dataset
-    # --------------------
-    print("Datasets:")
-    print(" - TinyStories (streaming)")
-    print(" - OpenWebText (streaming)")
-    print("Mixing ratio: 60% / 40%\n")
 
     train_dataset = StreamingLanguageModelDataset(
         iterable_ds,
@@ -146,39 +117,16 @@ def train(iterable_ds):
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        num_workers=0,   # REQUIRED for IterableDataset
+        num_workers=0,   # correct for IterableDataset
         pin_memory=True
     )
 
-    # --------------------
-    # Model
-    # --------------------
     vocab_size = 100277  # cl100k_base
     model = get_model(vocab_size).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params:,}\n")
+    print(f"Model parameters: {n_params:,}")
 
-    # --------------------
-    # Tokenizer + sample
-    # --------------------
-    tokenizer = tiktoken.get_encoding("cl100k_base")
-
-    print("🔍 Sample generation BEFORE training:\n")
-    print(
-        sample_text(
-            model,
-            tokenizer,
-            device,
-            prompt="Once upon a time",
-            max_new_tokens=60
-        )
-    )
-    print("\n" + "=" * 80 + "\n")
-
-    # --------------------
-    # Optimizer / loss / scheduler
-    # --------------------
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LR,
@@ -195,18 +143,16 @@ def train(iterable_ds):
         T_max=total_steps
     )
 
-    # --------------------
-    # Training
-    # --------------------
-    print(f"Starting Training | {EPOCHS} epochs | {total_steps:,} steps")
-    print("=" * 80)
-
     global_step = 0
-    token_counter = [0]
     run_start_time = time.time()
 
+    print("\n" + "=" * 70)
+    print(f"Starting Training | {EPOCHS} epochs | {total_steps:,} steps")
+    print("=" * 70)
+
     for epoch in range(EPOCHS):
-        print(f"\nEpoch {epoch+1}/{EPOCHS}")
+        print("\n" + "-" * 60)
+        print(f"Epoch {epoch+1}/{EPOCHS}")
         print("-" * 60)
 
         global_step = train_one_epoch(
@@ -219,8 +165,7 @@ def train(iterable_ds):
             epoch,
             global_step,
             total_steps,
-            token_counter,
-            run_start_time,
+            run_start_time
         )
 
         ckpt = Path(MODEL_FOLDER) / f"checkpoint_epoch_{epoch:02d}.pt"
@@ -230,33 +175,19 @@ def train(iterable_ds):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "global_step": global_step,
-                "tokens_seen": token_counter[0],
             },
             ckpt
         )
         print(f"✓ Checkpoint saved: {ckpt}")
 
-    # --------------------
-    # Final summary
-    # --------------------
-    total_time_hours = (time.time() - run_start_time) / 3600
-    total_tokens = token_counter[0]
-    chinchilla_ratio = total_tokens / n_params
-
-    print("\n" + "=" * 80)
-    print("📊 Training Summary")
-    print(f"Total parameters : {n_params:,}")
-    print(f"Total tokens     : {total_tokens:,}")
-    print(f"Chinchilla ratio : {chinchilla_ratio:.2f} tokens/param")
-    print(f"Total time       : {total_time_hours:.2f} hours")
-    print("=" * 80)
+    total_hours = (time.time() - run_start_time) / 3600
+    print("\n" + "=" * 70)
+    print(f"Training complete in {total_hours:.2f} hours")
+    print("=" * 70)
 
     return model
 
 
-# ============================================================
-# Entry point
-# ============================================================
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
 
