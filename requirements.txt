@@ -1,0 +1,15 @@
+# Core
+torch
+numpy
+
+# Tokenization
+tiktoken
+
+# Datasets (streaming)
+datasets
+
+# Progress / utilities
+tqdm
+
+# Optional but recommended (better perf / stability)
+accelerate
