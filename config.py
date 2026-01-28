@@ -61,8 +61,7 @@ GRAD_ACCUM_STEPS = 16   # effective batch = 64
 # TRAINING SCHEDULE 
 # ============================================================
 
-EPOCHS = 1
-STEPS_PER_EPOCH = 500
+EPOCHS = 4
 
 # ============================================================
 # OPTIMIZATION
@@ -77,4 +76,4 @@ WEIGHT_DECAY = 0.1
 
 MODEL_FOLDER = "checkpoints"
 PRELOAD = None
-VAL_SPLIT = 0.05
+VAL_SPLIT = 0.05    

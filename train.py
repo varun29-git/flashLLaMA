@@ -5,17 +5,23 @@ from tqdm import tqdm
 from pathlib import Path
 import warnings
 import time
-import math
 from collections import deque
+from datasets import load_dataset
 
 from config import *
 from model import build_llama
 from dataset import StreamingLanguageModelDataset
 
+# ==============================================================================
+# CONFIGURATION CONSTANTS (STRICT CURRICULUM)
+# ==============================================================================
+TOKEN_CAP_PER_PHASE = 500_000  # Reduced for verification
 
-# --------------------------------------------------
-# Model
-# --------------------------------------------------
+# Progressive LR Decay
+LR_PHASE_1 = 3e-4  # High (Bootstrapping)
+LR_PHASE_2 = 1e-4  # Medium (Structure)
+LR_PHASE_3 = 5e-5  # Low (Generalization)
+
 def get_model(vocab_size):
     return build_llama(
         vocab_size=vocab_size,
@@ -27,225 +33,170 @@ def get_model(vocab_size):
         dropout=DROPOUT
     )
 
+def train_phase(model, optimizer, scaler, dataset_name, phase_name, num_epochs, target_lr, vocab_size):
+    device = next(model.parameters()).device
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    
+    # Update Learning Rate for this phase
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = target_lr
+        
+    print("\n" + "=" * 80)
+    print(f"STARTING PHASE: {phase_name}")
+    print(f"Dataset: {dataset_name}")
+    print(f"Epochs: {num_epochs} (Logical Passes)")
+    print(f"Learning Rate: {target_lr}")
+    print(f"Token Cap: {TOKEN_CAP_PER_PHASE:,}")
+    print("=" * 80)
 
-def train_one_epoch(
-    model,
-    dataloader,
-    optimizer,
-    scheduler,
-    loss_fn,
-    device,
-    epoch,
-    global_step,
-    total_steps,
-    run_start_time,
-):
-    model.train()
+    total_phase_tokens = 0
+    
+    for epoch in range(num_epochs):
+        print(f"\n--- Epoch {epoch+1}/{num_epochs} of {phase_name} ---")
+        
+        # Load Dataset Stream (Restarted each epoch)
+        try:
+            # Handle potential dataset loading errors (e.g. bookcorpus vs bookcorpus/bookcorpus)
+            if dataset_name == "bookcorpus":
+                ds = load_dataset(dataset_name, split="train", streaming=True, trust_remote_code=True)
+            else:
+                ds = load_dataset(dataset_name, split="train", streaming=True)
+        except Exception as e:
+            print(f"Error loading dataset {dataset_name}: {e}")
+            return
 
-    # Rolling stats
-    loss_window = deque(maxlen=50)
-    epoch_start_time = time.time()
-    tokens_seen = 0
+        train_dataset = StreamingLanguageModelDataset(
+            ds,
+            seq_len=SEQ_LEN,
+            tokenizer_name="cl100k_base"
+        )
+        
+        dataloader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            num_workers=0,
+            pin_memory=True
+        )
 
-    pbar = tqdm(
-        dataloader,
-        total=STEPS_PER_EPOCH,
-        desc=f"Epoch {epoch+1}/{EPOCHS}",
-        dynamic_ncols=True,
-        leave=True
-    )
+        model.train()
+        loss_window = deque(maxlen=50)
+        pbar = tqdm(dataloader, desc=f"{phase_name} E{epoch+1}", dynamic_ncols=True)
+        
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            targets = batch["targets"].to(device, non_blocking=True)
+            
+            # --- TOKEN ACCOUNTING ---
+            batch_tokens = input_ids.numel()
+            if total_phase_tokens + batch_tokens > TOKEN_CAP_PER_PHASE:
+                print(f"\n[STOP] Token Cap Reached for {phase_name}: {total_phase_tokens + batch_tokens:,} > {TOKEN_CAP_PER_PHASE:,}")
+                return  # End Phase Immediately
+            
+            total_phase_tokens += batch_tokens
 
-    for step, batch in enumerate(pbar):
-        if step >= STEPS_PER_EPOCH:
-            break
+            # --- OPTIMIZATION STEP ---
+            optimizer.zero_grad(set_to_none=True)
 
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        targets = batch["targets"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
+                logits = model(input_ids)
+                loss = loss_fn(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1)
+                )
 
-        optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
 
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits = model(input_ids)
-            loss = loss_fn(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1)
-            )
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
-
-        # ---- stats ----
-        loss_window.append(loss.item())
-        tokens_seen += input_ids.numel()
-        global_step += 1
-
-        elapsed = time.time() - epoch_start_time
-        run_elapsed = time.time() - run_start_time
-
-        tok_per_sec = tokens_seen / max(elapsed, 1e-6)
-        avg_loss = sum(loss_window) / len(loss_window)
-        lr = scheduler.get_last_lr()[0]
-
-        steps_left = total_steps - global_step
-        eta_seconds = steps_left * (run_elapsed / max(global_step, 1))
-        eta_hours = eta_seconds / 3600
-
-        pbar.set_postfix({
-            "loss": f"{avg_loss:6.3f}",
-            "lr": f"{lr:.2e}",
-            "tok/s": f"{tok_per_sec/1000:.1f}k",
-            "ETA(h)": f"{eta_hours:5.2f}"
-        })
-
-    return global_step
+            # --- STATS ---
+            loss_window.append(loss.item())
+            avg_loss = sum(loss_window) / len(loss_window)
+            pbar.set_postfix({
+                "loss": f"{avg_loss:.4f}",
+                "lr": f"{target_lr:.1e}",
+                "Tok": f"{total_phase_tokens/1e6:.2f}M"
+            })
+            
+        print(f"Epoch {epoch+1} Complete. Tokens so far: {total_phase_tokens:,}")
 
 
-def train(iterable_ds, dataset_name="Custom Dataset", dataset_sample="", pretrained_model=None):
+def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     Path(MODEL_FOLDER).mkdir(parents=True, exist_ok=True)
-
-    train_dataset = StreamingLanguageModelDataset(
-        iterable_ds,
-        seq_len=SEQ_LEN,
-        tokenizer_name="cl100k_base"
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=0,   # correct for IterableDataset
-        pin_memory=True
-    )
-
-    vocab_size = 100277  # cl100k_base
-    if pretrained_model:
-        model = pretrained_model
-        print("Using pretrained model for curriculum learning.")
-    else:
-        model = get_model(vocab_size).to(device)
-
-    print("\n" + "=" * 70)
-    print(f"Dataset: {dataset_name}")
-    print("-" * 70)
-    print(f"Sample:\n{dataset_sample}...")
-    print("=" * 70)
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {n_params:,}")
-
+    
+    vocab_size = 100277
+    model = get_model(vocab_size).to(device)
+    
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+    
+    # Initialize Optimizer (Maintains state across phases)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LR,
-        weight_decay=WEIGHT_DECAY,
+        lr=LR_PHASE_1,  # Start with Phase 1 LR
+        weight_decay=0.1,
         betas=(0.9, 0.95),
         eps=1e-8
     )
 
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model Parameters: {n_params:,}")
 
-    total_steps = EPOCHS * STEPS_PER_EPOCH
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps
+    # ==========================================================================
+    # PHASE 1: TinyStories (Bootstrapping) - 2 Epochs, High LR
+    # ==========================================================================
+    train_phase(
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        dataset_name="roneneldan/TinyStories",
+        phase_name="Phase 1 (TinyStories)",
+        num_epochs=2,
+        target_lr=LR_PHASE_1,
+        vocab_size=vocab_size
     )
-
-    global_step = 0
-    run_start_time = time.time()
-
-    print("\n" + "=" * 70)
-    print(f"Starting Training | {EPOCHS} epochs | {total_steps:,} steps")
-    print("=" * 70)
-
-    for epoch in range(EPOCHS):
-        print("\n" + "-" * 60)
-        print(f"Epoch {epoch+1}/{EPOCHS}")
-        print("-" * 60)
-
-        global_step = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scheduler,
-            loss_fn,
-            device,
-            epoch,
-            global_step,
-            total_steps,
-            run_start_time
-        )
-
-        ckpt = Path(MODEL_FOLDER) / f"checkpoint_epoch_{epoch:02d}.pt"
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "global_step": global_step,
-            },
-            ckpt
-        )
-        print(f"✓ Checkpoint saved: {ckpt}")
-
-    total_hours = (time.time() - run_start_time) / 3600
     
-    # Chinchilla Ratio
-    total_tokens = global_step * BATCH_SIZE * SEQ_LEN
-    chinchilla_ratio = total_tokens / n_params
+    # Save Checkpoint after Phase 1
+    torch.save(model.state_dict(), f"{MODEL_FOLDER}/checkpoint_phase1.pt")
 
-    print("\n" + "=" * 70)
-    print(f"Training complete in {total_hours:.2f} hours")
-    print(f"Total Tokens: {total_tokens:,}")
-    print(f"Chinchilla Ratio: {chinchilla_ratio:.2f} tokens/param")
-    print("=" * 70)
+    # ==========================================================================
+    # PHASE 2: BookCorpus (Structure) - 2 Epochs, Medium LR
+    # ==========================================================================
+    train_phase(
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        dataset_name="bookcorpus", 
+        phase_name="Phase 2 (BookCorpus)",
+        num_epochs=2,
+        target_lr=LR_PHASE_2,
+        vocab_size=vocab_size
+    )
+    
+    # Save Checkpoint after Phase 2
+    torch.save(model.state_dict(), f"{MODEL_FOLDER}/checkpoint_phase2.pt")
 
-    return model
-
+    # ==========================================================================
+    # PHASE 3: OpenWebText (Generalization) - 1 Epoch, Low LR, Truncated to Cap
+    # ==========================================================================
+    train_phase(
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        dataset_name="Skylion007/openwebtext",
+        phase_name="Phase 3 (OpenWebText)",
+        num_epochs=1,
+        target_lr=LR_PHASE_3,
+        vocab_size=vocab_size
+    )
+    
+    # Final Save
+    torch.save(model.state_dict(), f"{MODEL_FOLDER}/model_final.pt")
+    print("\nTRAINING COMPLETE.")
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
-
-    from datasets import load_dataset, interleave_datasets
-
-    ds_tiny = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
-    ds_openweb = load_dataset("Skylion007/openwebtext", split="train", streaming=True)
-
-    # Phase 1: TinyStories only
-    print("\n" + "#" * 80)
-    print("PHASE 1: TinyStories Baseline")
-    print("#" * 80)
-    
-    # Peek at one sample for Phase 1
-    sample_item_tiny = next(iter(ds_tiny))
-    sample_text_tiny = sample_item_tiny["text"][:500]
-
-    model_phase1 = train(
-        ds_tiny, 
-        dataset_name="Phase 1: TinyStories (100%)", 
-        dataset_sample=sample_text_tiny
-    )
-
-    # Phase 2: Curriculum Mix (80% Tiny + 20% OpenWebText)
-    print("\n" + "#" * 80)
-    print("PHASE 2: Curriculum Mix (80% Tiny + 20% OWT)")
-    print("#" * 80)
-
-    ds_mixed = interleave_datasets(
-        [ds_tiny, ds_openweb],
-        probabilities=[0.8, 0.2],
-        seed=42
-    )
-    
-    # Peek at one sample for Phase 2
-    sample_item_mixed = next(iter(ds_mixed))
-    sample_text_mixed = sample_item_mixed["text"][:500]
-
-    train(
-        ds_mixed, 
-        dataset_name="Phase 2: Mixed (80% Tiny + 20% OWT)", 
-        dataset_sample=sample_text_mixed,
-        pretrained_model=model_phase1
-    )
+    train()
