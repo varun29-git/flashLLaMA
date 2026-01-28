@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+from tqdm.notebook import tqdm
 from pathlib import Path
 import warnings
 import time
