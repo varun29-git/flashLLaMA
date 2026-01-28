@@ -102,7 +102,7 @@ def train_one_epoch(
     return global_step
 
 
-def train(iterable_ds, dataset_name="Custom Dataset", dataset_sample=""):
+def train(iterable_ds, dataset_name="Custom Dataset", dataset_sample="", pretrained_model=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -122,7 +122,11 @@ def train(iterable_ds, dataset_name="Custom Dataset", dataset_sample=""):
     )
 
     vocab_size = 100277  # cl100k_base
-    model = get_model(vocab_size).to(device)
+    if pretrained_model:
+        model = pretrained_model
+        print("Using pretrained model for curriculum learning.")
+    else:
+        model = get_model(vocab_size).to(device)
 
     print("\n" + "=" * 70)
     print(f"Dataset: {dataset_name}")
@@ -209,16 +213,39 @@ if __name__ == "__main__":
     ds_tiny = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
     ds_openweb = load_dataset("Skylion007/openwebtext", split="train", streaming=True)
 
-    mixed_iterable = interleave_datasets(
-        [ds_tiny, ds_openweb],
-        probabilities=[0.6, 0.4],
-        seed=42
+    # Phase 1: TinyStories only
+    print("\n" + "#" * 80)
+    print("PHASE 1: TinyStories Baseline")
+    print("#" * 80)
+    
+    # Peek at one sample for Phase 1
+    sample_item_tiny = next(iter(ds_tiny))
+    sample_text_tiny = sample_item_tiny["text"][:500]
+
+    model_phase1 = train(
+        ds_tiny, 
+        dataset_name="Phase 1: TinyStories (100%)", 
+        dataset_sample=sample_text_tiny
     )
 
-    dataset_composition = "TinyStories (60%) + OpenWebText (40%)"
-    
-    # Peek at one sample
-    sample_item = next(iter(mixed_iterable))
-    sample_text = sample_item["text"][:500] # Take first 500 chars for display
+    # Phase 2: Curriculum Mix (80% Tiny + 20% OpenWebText)
+    print("\n" + "#" * 80)
+    print("PHASE 2: Curriculum Mix (80% Tiny + 20% OWT)")
+    print("#" * 80)
 
-    train(mixed_iterable, dataset_name=dataset_composition, dataset_sample=sample_text)
+    ds_mixed = interleave_datasets(
+        [ds_tiny, ds_openweb],
+        probabilities=[0.8, 0.2],
+        seed=42
+    )
+    
+    # Peek at one sample for Phase 2
+    sample_item_mixed = next(iter(ds_mixed))
+    sample_text_mixed = sample_item_mixed["text"][:500]
+
+    train(
+        ds_mixed, 
+        dataset_name="Phase 2: Mixed (80% Tiny + 20% OWT)", 
+        dataset_sample=sample_text_mixed,
+        pretrained_model=model_phase1
+    )
