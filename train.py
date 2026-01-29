@@ -15,6 +15,7 @@ import random
 import math
 
 ESTIMATED_TOTAL_TOKENS = 1_725_000_000
+LR_PHASE_1 = 3e-4
 
 # Constants for Schedule
 PHASE1_DURATION = 525_000_000
