@@ -159,7 +159,8 @@ def train_phase(model, optimizer, scaler, dataset_name, phase_name, num_epochs, 
             bar_format="{desc}: {percentage:3.0f}%|{bar}| [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
         )
         
-        for batch in pbar:
+        optimizer.zero_grad(set_to_none=True)
+        for batch_idx, batch in enumerate(pbar):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             targets = batch["targets"].to(device, non_blocking=True)
             
@@ -176,8 +177,6 @@ def train_phase(model, optimizer, scaler, dataset_name, phase_name, num_epochs, 
             if global_tracker:
                 global_tracker['tokens_seen'] += batch_tokens
 
-            optimizer.zero_grad(set_to_none=True)
-
             with torch.autocast(device_type=device.type, dtype=torch.float16):
                 logits = model(input_ids)
                 loss = loss_fn(
@@ -185,11 +184,17 @@ def train_phase(model, optimizer, scaler, dataset_name, phase_name, num_epochs, 
                     targets.view(-1)
                 )
 
+            # Loss Normalization for Gradient Accumulation
+            loss = loss / GRAD_ACCUM_STEPS
+
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+
+            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
             # --- STATS ---
             loss_window.append(loss.item())
