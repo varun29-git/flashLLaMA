@@ -7,19 +7,81 @@ import warnings
 import time
 from collections import deque
 from datasets import load_dataset
+import random
+import math
+import logging
+from typing import Callable, Optional, Dict
 
 from config import *
 from model import build_llama
 from dataset import StreamingLanguageModelDataset
-import random
 
-ESTIMATED_TOTAL_TOKENS = 1_825_000_000
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(f"{MODEL_FOLDER}/training.log")
+    ]
+)
 
-LR_PHASE_1 = 3e-4  
-LR_PHASE_2 = 1e-4  
-LR_PHASE_3 = 5e-5  
+class ChinchillaScheduler:
+    """
+    Custom Scheduler for Chinchilla-Optimal Training Pipeline.
+    
+    Schedule:
+    - Phase 1 (0 -> PHASE1_DURATION):
+        - 0 -> 180M: Constant LR_MAX
+        - 180M -> End: Cosine Decay to LR_MIN_PHASE1
+    - Phase 2 (PHASE1_DURATION -> End):
+        - Start -> +50M: Linear Warmup to LR_MAX_PHASE2
+        - +50M -> End: Cosine Decay to LR_MIN_PHASE2
+    """
+    def __init__(self, optimizer: torch.optim.Optimizer):
+        self.optimizer = optimizer
+        
+    def step(self, tokens_seen: int) -> float:
+        lr = self._calculate_lr(tokens_seen)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        return lr
 
-def get_model(vocab_size):
+    def _calculate_lr(self, tokens_seen: int) -> float:
+        # PHASE 1
+        if tokens_seen < PHASE1_DURATION:
+            if tokens_seen < 180_000_000:
+                return LR_MAX
+            
+            # Cosine Decay
+            progress = (tokens_seen - 180_000_000) / (PHASE1_DURATION - 180_000_000)
+            progress = max(0.0, min(1.0, progress))
+            return self._cosine_decay(LR_MAX, LR_MIN_PHASE1, progress)
+
+        # PHASE 2
+        else:
+            phase2_tokens = tokens_seen - PHASE1_DURATION
+            
+            # Linear Warmup (50M tokens)
+            if phase2_tokens < 50_000_000:
+                progress = phase2_tokens / 50_000_000
+                # Linear Interpolation
+                return LR_MIN_PHASE1 + (LR_MAX_PHASE2 - LR_MIN_PHASE1) * progress
+                
+            # Cosine Decay (Remaining)
+            else:
+                decay_tokens = phase2_tokens - 50_000_000
+                total_decay_duration = PHASE2_DURATION - 50_000_000
+                progress = decay_tokens / total_decay_duration
+                progress = max(0.0, min(1.0, progress))
+                return self._cosine_decay(LR_MAX_PHASE2, LR_MIN_PHASE2, progress)
+
+    def _cosine_decay(self, start_val: float, end_val: float, progress: float) -> float:
+        cosine_coeff = 0.5 * (1 + math.cos(math.pi * progress))
+        return end_val + (start_val - end_val) * cosine_coeff
+
+
+def get_model(vocab_size: int) -> nn.Module:
     return build_llama(
         vocab_size=vocab_size,
         d_model=D_MODEL,
@@ -30,35 +92,31 @@ def get_model(vocab_size):
         dropout=DROPOUT
     )
 
-def validate(model, dataset_name, device, steps=50):
-    """Runs a quick validation loop on the validation or test split."""
-    print(f"\n--- Running Validation for {dataset_name} ---")
+def validate(model: nn.Module, dataset_name: str, device: torch.device, steps: int = 50) -> float:
+    """Runs a quick validation loop."""
+    logging.info(f"Running Validation for {dataset_name}...")
     model.eval()
     
-    ds = None
     try:
-        # Try validation split first
-        ds = load_dataset(dataset_name, split="validation", streaming=True)
+        if dataset_name == "incredible45/Gutenberg-BookCorpus-Cleaned-Data-English":
+            ds = load_dataset(dataset_name, split="validation", streaming=True).rename_column("context", "text")
+        elif dataset_name == "HuggingFaceFW/fineweb-edu":
+            ds = load_dataset(dataset_name, name="sample-10BT", split="validation", streaming=True) # Fallback to train if no val? usually FW has distinct splits or we just use streaming train
+            # FineWeb sample-10BT often doesn't split in streaming easily without config. assuming 'train' for now if fails.
+        else:
+            ds = load_dataset(dataset_name, split="validation", streaming=True)
     except Exception:
+        logging.warning(f"Could not load validation split for {dataset_name}. Using 'train' stream for validation proxy.")
         try:
-            # Fallback to test split
-            ds = load_dataset(dataset_name, split="test", streaming=True)
-        except Exception:
-            print(f"No validation/test split found for {dataset_name}. Skipping validation.")
-            model.train()
-            return None
+             ds = load_dataset(dataset_name, split="train", streaming=True)
+             if dataset_name == "incredible45/Gutenberg-BookCorpus-Cleaned-Data-English":
+                 ds = ds.rename_column("context", "text")
+        except:
+             logging.error("Failed to load dataset for validation.")
+             return 0.0
 
-    val_dataset = StreamingLanguageModelDataset(
-        ds,
-        seq_len=SEQ_LEN,
-        tokenizer_name="cl100k_base"
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=0
-    )
+    val_dataset = StreamingLanguageModelDataset(ds, SEQ_LEN, "cl100k_base")
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=0)
     
     val_loss_accum = 0.0
     steps_done = 0
@@ -67,352 +125,212 @@ def validate(model, dataset_name, device, steps=50):
     with torch.no_grad():
         with torch.autocast(device_type=device.type, dtype=torch.float16):
             for i, batch in enumerate(val_loader):
-                if i >= steps:
-                    break
+                if i >= steps: break
                 
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 targets = batch["targets"].to(device, non_blocking=True)
                 
                 logits = model(input_ids)
-                loss = loss_fn(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1)
-                )
+                loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
                 val_loss_accum += loss.item()
                 steps_done += 1
     
-    avg_val_loss = val_loss_accum / max(steps_done, 1)
-    print(f"Validation Loss: {avg_val_loss:.4f}")
-    
+    avg_loss = val_loss_accum / max(steps_done, 1)
+    logging.info(f"Validation Loss: {avg_loss:.4f}")
     model.train()
-    return avg_val_loss
+    return avg_loss
 
 
-    return avg_val_loss
-
-
-def train_mixed_phase(model, optimizer, scaler, vocab_size, global_tracker=None):
+def run_training_phase(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler,
+    scheduler: ChinchillaScheduler,
+    primary_ds_name: str,
+    mixing_strategy: Callable[[float], float], 
+    duration: int,
+    phase_name: str,
+    global_tracker: Dict
+):
+    """
+    Unified Training Loop for Mixed Phases.
+    
+    Args:
+        mixing_strategy: Function(progress) -> tiny_stories_ratio
+    """
     device = next(model.parameters()).device
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     
-    # Configuration for Mix
-    target_ts_tokens = 75_000_000
-    target_gb_tokens = 550_000_000
+    logging.info("="*60)
+    logging.info(f"STARTING PHASE: {phase_name}")
+    logging.info(f"Duration: {duration:,} tokens")
+    logging.info("="*60)
     
-    # Calculate Mix Strategy
-    # Average Ratio = 0.3 (linear 0.6 -> 0.0)
-    # Duration of Mix = 75M / 0.3 = 250M
-    mix_duration = 250_000_000
-    total_duration = 250_000_000 + (target_gb_tokens - 175_000_000) # 250M + 375M = 625M
-    
-    phase_name = "Mixed Phase (TS 60%->0% | GB 40%->100%)"
-    print("\n" + "=" * 80)
-    print(f"STARTING PHASE: {phase_name}")
-    print(f"Total Tokens: {total_duration:,}")
-    print(f"  - TinyStories: {target_ts_tokens:,}")
-    print(f"  - Gutenberg: {target_gb_tokens:,}")
-    print("=" * 80)
-
     # Initialize Datasets
     ds_ts = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
-    ds_gb = load_dataset("incredible45/Gutenberg-BookCorpus-Cleaned-Data-English", split="train", streaming=True).rename_column("context", "text")
+    
+    if primary_ds_name == "incredible45/Gutenberg-BookCorpus-Cleaned-Data-English":
+        ds_primary = load_dataset(primary_ds_name, split="train", streaming=True).rename_column("context", "text")
+    elif primary_ds_name == "HuggingFaceFW/fineweb-edu":
+        ds_primary = load_dataset(primary_ds_name, name="sample-10BT", split="train", streaming=True)
+    else:
+        ds_primary = load_dataset(primary_ds_name, split="train", streaming=True)
 
+    dl_primary = DataLoader(StreamingLanguageModelDataset(ds_primary, SEQ_LEN, "cl100k_base"), batch_size=BATCH_SIZE, num_workers=0)
     dl_ts = DataLoader(StreamingLanguageModelDataset(ds_ts, SEQ_LEN, "cl100k_base"), batch_size=BATCH_SIZE, num_workers=0)
-    dl_gb = DataLoader(StreamingLanguageModelDataset(ds_gb, SEQ_LEN, "cl100k_base"), batch_size=BATCH_SIZE, num_workers=0)
-
+    
+    iter_primary = iter(dl_primary)
     iter_ts = iter(dl_ts)
-    iter_gb = iter(dl_gb)
-
+    
     total_phase_tokens = 0
+    pbar = tqdm(total=duration // (BATCH_SIZE * SEQ_LEN), desc="Training", dynamic_ncols=True)
     
-    # Progress Bar
-    pbar = tqdm(total=total_duration // (BATCH_SIZE * SEQ_LEN), desc="Mixed Training", dynamic_ncols=True)
-    
-    # Set LR for Phase 1/2 blend (using Phase 1 LR for now or decaying? implementation plan didn't specify, using LR_PHASE_1)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = LR_PHASE_1
-
-    model.train()
     loss_window = deque(maxlen=50)
+    step = 0
+    
+    model.train()
     optimizer.zero_grad(set_to_none=True)
     
-    step = 0
-    while total_phase_tokens < total_duration:
+    while total_phase_tokens < duration:
         step += 1
         
-        # Calculate Current Ratio
-        if total_phase_tokens < mix_duration:
-            progress = total_phase_tokens / mix_duration
-            p_ts = 0.6 * (1.0 - progress)
-        else:
-            p_ts = 0.0
-            
-        # Select Batch
-        use_ts = random.random() < p_ts
+        # 1. Update Learning Rate
+        current_lr = scheduler.step(global_tracker['tokens_seen'])
         
+        # 2. Determine Batch Source
+        progress = total_phase_tokens / duration
+        progress = max(0.0, min(1.0, progress))
+        ts_ratio = mixing_strategy(progress)
+        
+        use_ts = random.random() < ts_ratio
+        
+        # 3. Fetch Batch
         try:
-            if use_ts:
-                batch = next(iter_ts)
-            else:
-                batch = next(iter_gb)
+            batch = next(iter_ts) if use_ts else next(iter_primary)
         except StopIteration:
-            # Restart iterator if exhausted (unlikely for GB, possible for TS if small)
-             # But here we assume streaming is infinite or cycles? 
-             # Streamingdatasets loop? No, HF streaming raises StopIteration.
-             # Re-init iter
+            # Restart exhausted iterator
             if use_ts:
                 iter_ts = iter(dl_ts)
                 batch = next(iter_ts)
             else:
-                iter_gb = iter(dl_gb)
-                batch = next(iter_gb)
-
+                iter_primary = iter(dl_primary)
+                batch = next(iter_primary)
+                
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         targets = batch["targets"].to(device, non_blocking=True)
-        
         batch_tokens = input_ids.numel()
+        
         total_phase_tokens += batch_tokens
+        global_tracker['tokens_seen'] += batch_tokens
         pbar.update(1)
         
-        if global_tracker:
-            global_tracker['tokens_seen'] += batch_tokens
-
+        # 4. Forward & Backward
         with torch.autocast(device_type=device.type, dtype=torch.float16):
             logits = model(input_ids)
             loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
-
+            
         loss = loss / GRAD_ACCUM_STEPS
         scaler.scale(loss).backward()
-
+        
+        # 5. Gradient Accumulation Step
         if step % GRAD_ACCUM_STEPS == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-
-        loss_window.append(loss.item() * GRAD_ACCUM_STEPS) # Store actual loss
+            
+        # 6. Logging
+        loss_window.append(loss.item() * GRAD_ACCUM_STEPS)
         avg_loss = sum(loss_window) / len(loss_window)
         
-        # ETA
-        eta_str = "??"
-        if global_tracker:
-             elapsed = time.time() - global_tracker['start_time']
-             rate = global_tracker['tokens_seen'] / max(elapsed, 1e-6)
-             remaining = ESTIMATED_TOTAL_TOKENS - global_tracker['tokens_seen']
-             eta_seconds = remaining / max(rate, 1e-6)
-             eta_str = f"{int(eta_seconds//3600)}h {int((eta_seconds%3600)//60)}m"
-
-        pbar.set_description(f"Mixed | TS% {p_ts*100:.1f} | ETA: {eta_str} | L: {avg_loss:.4f}")
-
+        eta_seconds = (ESTIMATED_TOTAL_TOKENS - global_tracker['tokens_seen']) / max(global_tracker['tokens_seen'] / (time.time() - global_tracker['start_time'] + 1e-6), 1e-6)
+        eta_str = f"{int(eta_seconds//3600)}h {int((eta_seconds%3600)//60)}m"
+        
+        pbar.set_description(f"TS% {ts_ratio*100:.1f} | LR {current_lr:.2e} | ETA {eta_str} | L {avg_loss:.4f}")
+        
     pbar.close()
-    print(f"Mixed Phase Complete. Tokens: {total_phase_tokens:,}")
-    validate(model, "incredible45/Gutenberg-BookCorpus-Cleaned-Data-English", device)
-
-
-def train_phase(model, optimizer, scaler, dataset_name, phase_name, num_epochs, target_lr, vocab_size, max_tokens=None, global_tracker=None, soft_cap=False):
-    device = next(model.parameters()).device
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
-    
-    # Update Learning Rate 
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = target_lr
-        
-    print("\n" + "=" * 80)
-    print(f"STARTING PHASE: {phase_name}")
-    print(f"Dataset: {dataset_name}")
-    print(f"Epochs: {num_epochs} (Logical Passes)")
-    print(f"Learning Rate: {target_lr}")
-    if max_tokens:
-        cap_type = "Soft" if soft_cap else "Hard"
-        print(f"Token Cap: {max_tokens:,} [{cap_type}]")
-    else:
-        print("Token Cap: None (Full Dataset Phase)")
-    print("=" * 80)
-
-    total_phase_tokens = 0
-    
-    for epoch in range(num_epochs):
-        print(f"\n--- Epoch {epoch+1}/{num_epochs} of {phase_name} ---")
-        
-        # Load Dataset Stream (Restarted each epoch)
-        try:
-            if dataset_name == "incredible45/Gutenberg-BookCorpus-Cleaned-Data-English":
-                ds = load_dataset(dataset_name, split="train", streaming=True)
-                # Map 'context' to 'text' 
-                ds = ds.rename_column("context", "text")
-            elif dataset_name == "HuggingFaceFW/fineweb-edu":
-                # Use the sample-10BT 
-                ds = load_dataset(dataset_name, name="sample-10BT", split="train", streaming=True)
-            else:
-                ds = load_dataset(dataset_name, split="train", streaming=True)
-            
-
-            
-            # Sample display removed as requested
-
-        except Exception as e:
-            print(f"Error loading dataset {dataset_name}: {e}")
-            return
-
-        # Pass max_tokens to dataset ONLY if soft_cap is True
-        ds_max_tokens = max_tokens if soft_cap else None
-        
-        train_dataset = StreamingLanguageModelDataset(
-            ds,
-            seq_len=SEQ_LEN,
-            tokenizer_name="cl100k_base",
-            max_tokens=ds_max_tokens
-        )
-        
-        dataloader = DataLoader(
-            train_dataset,
-            batch_size=BATCH_SIZE,
-            num_workers=0,
-            pin_memory=True
-        )
-
-        model.train()
-        loss_window = deque(maxlen=50)
-        
-        # Calculate Total Batches for ETA
-        if max_tokens:
-            total_batches = max_tokens // (BATCH_SIZE * SEQ_LEN)
-        elif "TinyStories" in dataset_name:
-            total_batches = 470_000_000 // (BATCH_SIZE * SEQ_LEN)  # Approx 470M tokens
-        else:
-            total_batches = None
-
-        pbar = tqdm(
-            dataloader, 
-            total=total_batches,
-            desc=f"Epoch {epoch+1}", 
-            dynamic_ncols=True
-        )
-        
-        optimizer.zero_grad(set_to_none=True)
-        for batch_idx, batch in enumerate(pbar):
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            targets = batch["targets"].to(device, non_blocking=True)
-            
-            batch_tokens = input_ids.numel()
-            
-            # Hard Cap Check: Only if soft_cap is False
-            if not soft_cap and max_tokens is not None and (total_phase_tokens + batch_tokens > max_tokens):
-                print(f"\n[STOP] Token Cap Reached for {phase_name}: {total_phase_tokens + batch_tokens:,} > {max_tokens:,}")
-                return  # End Phase Immediately
-            
-            total_phase_tokens += batch_tokens
-            
-            # Global Tracker Update
-            if global_tracker:
-                global_tracker['tokens_seen'] += batch_tokens
-
-            with torch.autocast(device_type=device.type, dtype=torch.float16):
-                logits = model(input_ids)
-                loss = loss_fn(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1)
-                )
-
-            # Loss Normalization for Gradient Accumulation
-            loss = loss / GRAD_ACCUM_STEPS
-
-            scaler.scale(loss).backward()
-
-            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-
-            # --- STATS ---
-            loss_window.append(loss.item())
-            avg_loss = sum(loss_window) / len(loss_window)
-            
-            # Global ETA Calculation
-            eta_str = "??"
-            if global_tracker:
-                elapsed = time.time() - global_tracker['start_time']
-                rate = global_tracker['tokens_seen'] / max(elapsed, 1e-6)
-                remaining = ESTIMATED_TOTAL_TOKENS - global_tracker['tokens_seen']
-                eta_seconds = remaining / max(rate, 1e-6)
-                eta_str = f"{int(eta_seconds//3600)}h {int((eta_seconds%3600)//60)}m"
-
-            pbar.set_description(f"Epoch {epoch+1} | ETA: {eta_str} | Loss: {avg_loss:.4f}")
-            
-        print(f"Epoch {epoch+1} Complete. Tokens so far: {total_phase_tokens:,}")
-        
-        # Validation Step
-        validate(model, dataset_name, device)
+    logging.info(f"Phase Complete. Tokens Processed: {total_phase_tokens:,}")
+    validate(model, primary_ds_name, device)
 
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logging.info(f"Using device: {device}")
 
     Path(MODEL_FOLDER).mkdir(parents=True, exist_ok=True)
     
-    vocab_size = 100277
+    vocab_size = 100277 # cl100k_base size
     model = get_model(vocab_size).to(device)
     
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
     
-    # Initialize Optimizer
+    # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LR_PHASE_1,
-        weight_decay=0.1,
+        lr=LR_MAX, # Initial, but scheduler overrides
+        weight_decay=WEIGHT_DECAY,
         betas=(0.9, 0.95),
         eps=1e-8
     )
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model Parameters: {n_params:,}")
     
-    # Global Progress Tracker
+    scheduler = ChinchillaScheduler(optimizer)
+    
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logging.info(f"Model Parameters: {n_params:,}")
+    logging.info(f"Total Target Tokens: {ESTIMATED_TOTAL_TOKENS:,}")
+    
     global_tracker = {
         'start_time': time.time(),
         'tokens_seen': 0
     }
 
-    # MIXED PHASE (TinyStories + Gutenberg)
-    
-    train_mixed_phase(
+    # ============================================================
+    # PHASE 1: Gutenberg + Decaying TinyStories
+    # ============================================================
+    # Strategy: Linear Decay 0.6 -> 0.1
+    def phase1_strategy(progress):
+        return PHASE1_TS_START - (PHASE1_TS_START - PHASE1_TS_END) * progress
+
+    run_training_phase(
         model=model,
         optimizer=optimizer,
         scaler=scaler,
-        vocab_size=vocab_size,
+        scheduler=scheduler,
+        primary_ds_name="incredible45/Gutenberg-BookCorpus-Cleaned-Data-English",
+        mixing_strategy=phase1_strategy,
+        duration=PHASE1_DURATION,
+        phase_name="Phase 1: Gutenberg + TS (Decay)",
         global_tracker=global_tracker
     )
-    
-    torch.save(model.state_dict(), f"{MODEL_FOLDER}/checkpoint_mixed.pt")
+    torch.save(model.state_dict(), f"{MODEL_FOLDER}/checkpoint_phase1.pt")
 
-    # PHASE 3 (FineWeb)
-    
+    # ============================================================
+    # PHASE 2: FineWeb + Fixed TinyStories
+    # ============================================================
+    # Strategy: Fixed 0.1
+    def phase2_strategy(progress):
+        return PHASE2_TS_FIXED
 
-    train_phase(
+    run_training_phase(
         model=model,
         optimizer=optimizer,
         scaler=scaler,
-        dataset_name="HuggingFaceFW/fineweb-edu",
-        phase_name="Phase 3 (FineWeb-Edu 1B)",
-        num_epochs=1,
-        target_lr=LR_PHASE_3,
-        vocab_size=vocab_size,
-        max_tokens=1_200_000_000, # 1.2B per epoch (Total 1.2B) 
-        global_tracker=global_tracker,
-        soft_cap=True
+        scheduler=scheduler,
+        primary_ds_name="HuggingFaceFW/fineweb-edu",
+        mixing_strategy=phase2_strategy,
+        duration=PHASE2_DURATION,
+        phase_name="Phase 2: FineWeb + TS (Fixed)",
+        global_tracker=global_tracker
     )
     
     torch.save(model.state_dict(), f"{MODEL_FOLDER}/model_final.pt")
     
     total_time = time.time() - global_tracker['start_time']
-    print("\n" + "=" * 80)
-    print(f"TRAINING COMPLETE. Total Time: {total_time/3600:.2f} hours")
-    print(f"Total Tokens Processed: {global_tracker['tokens_seen']:,}")
-    print("=" * 80)
+    logging.info("="*60)
+    logging.info(f"TRAINING COMPLETE. Total Time: {total_time/3600:.2f} hours")
+    logging.info(f"Total Tokens Processed: {global_tracker['tokens_seen']:,}")
+    logging.info("="*60)
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
