@@ -22,20 +22,6 @@ GRAD_ACCUM_STEPS = 8
 # ============================================================
 
 EPOCHS = 1                  
-ESTIMATED_TOTAL_TOKENS = 1_725_000_000
-PHASE1_DURATION = 525_000_000
-PHASE2_DURATION = 1_200_000_000
-
-# Mixing Params
-PHASE1_TS_START = 0.6
-PHASE1_TS_END = 0.1
-PHASE2_TS_FIXED = 0.1
-
-# LR Schedule
-LR_MAX = 3e-4
-LR_MIN_PHASE1 = 3e-5
-LR_MAX_PHASE2 = 1.5e-4
-LR_MIN_PHASE2 = 1.5e-5                  
 
 # ============================================================
 # OPTIMIZATION
