@@ -12,7 +12,7 @@ from config import *
 from model import build_llama
 from dataset import StreamingLanguageModelDataset
 
-ESTIMATED_TOTAL_TOKENS = 1_570_000_000
+ESTIMATED_TOTAL_TOKENS = 1_800_000_000
 
 LR_PHASE_1 = 3e-4  
 LR_PHASE_2 = 1e-4  
@@ -265,7 +265,7 @@ def train():
         num_epochs=1,
         target_lr=LR_PHASE_1,
         vocab_size=vocab_size,
-        max_tokens=30_000_000, # Cap at 30M
+        max_tokens=25_000_000, # Cap at 25M
         global_tracker=global_tracker,
         soft_cap=True
     )
@@ -283,7 +283,7 @@ def train():
         num_epochs=1, # Soft Cap controls duration within epoch
         target_lr=LR_PHASE_2,
         vocab_size=vocab_size,
-        max_tokens=440_000_000, # SOFT CAP AT 440 MILLION
+        max_tokens=550_000_000, # SOFT CAP AT 550 MILLION
         global_tracker=global_tracker,
         soft_cap=True
     )
@@ -302,7 +302,7 @@ def train():
         num_epochs=1,
         target_lr=LR_PHASE_3,
         vocab_size=vocab_size,
-        max_tokens=1_100_000_000, # 1.1B per epoch (Total 1.1B) 
+        max_tokens=1_200_000_000, # 1.2B per epoch (Total 1.2B) 
         global_tracker=global_tracker,
         soft_cap=True
     )
