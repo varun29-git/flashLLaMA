@@ -101,7 +101,7 @@ def train_phase(model, optimizer, scaler, dataset_name, phase_name, num_epochs, 
     print(f"Epochs: {num_epochs} (Logical Passes)")
     print(f"Learning Rate: {target_lr}")
     if max_tokens:
-        cap_type = "Soft (Finish Book)" if soft_cap else "Hard (Immediate Stop)"
+        cap_type = "Soft" if soft_cap else "Hard"
         print(f"Token Cap: {max_tokens:,} [{cap_type}]")
     else:
         print("Token Cap: None (Full Dataset Phase)")
@@ -163,9 +163,8 @@ def train_phase(model, optimizer, scaler, dataset_name, phase_name, num_epochs, 
         pbar = tqdm(
             dataloader, 
             total=total_batches,
-            desc=f"Processing Epoch{epoch:02d}", 
-            dynamic_ncols=True,
-            bar_format="{desc}: {percentage:3.0f}%|{bar}| [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+            desc=f"Epoch {epoch+1}", 
+            dynamic_ncols=True
         )
         
         optimizer.zero_grad(set_to_none=True)
@@ -218,7 +217,7 @@ def train_phase(model, optimizer, scaler, dataset_name, phase_name, num_epochs, 
                 eta_seconds = remaining / max(rate, 1e-6)
                 eta_str = f"{int(eta_seconds//3600)}h {int((eta_seconds%3600)//60)}m"
 
-            pbar.set_description(f"Processing Epoch{epoch:02d} | Global ETA: {eta_str} | Loss: {avg_loss:.4f}")
+            pbar.set_description(f"Epoch {epoch+1} | ETA: {eta_str} | Loss: {avg_loss:.4f}")
             
         print(f"Epoch {epoch+1} Complete. Tokens so far: {total_phase_tokens:,}")
         
