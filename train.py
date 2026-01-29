@@ -17,6 +17,8 @@ from model import build_llama
 from dataset import StreamingLanguageModelDataset
 
 # Configure Logging
+Path(MODEL_FOLDER).mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
