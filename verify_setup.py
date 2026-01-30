@@ -36,11 +36,31 @@ def verify():
         tokenizer = Tokenizer.from_file("tokenizer.json")
         print("Loaded tokenizer.json")
         
+        # 1. Cosmopedia
+        print("Checking Cosmopedia...")
         ds = load_dataset("HuggingFaceTB/cosmopedia", "web_samples_v2", split="train", streaming=True)
         dl = DataLoader(StreamingLanguageModelDataset(ds, SEQ_LEN, tokenizer), batch_size=1)
-        batch = next(iter(dl))
-        print("Successfully loaded one batch from Cosmopedia using custom tokenizer.")
-        print(f"Input shape: {batch['input_ids'].shape}")
+        next(iter(dl))
+        print("OK: Cosmopedia")
+
+        # 2. FineWeb-Edu
+        print("Checking FineWeb-Edu...")
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True)
+        dl = DataLoader(StreamingLanguageModelDataset(ds, SEQ_LEN, tokenizer), batch_size=1)
+        next(iter(dl))
+        print("OK: FineWeb-Edu")
+
+        # 3. Evol-Instruct
+        print("Checking Evol-Instruct...")
+        ds_raw = load_dataset("nickrosh/Evol-Instruct-Code-80k-v1", split="train", streaming=True)
+        def format_code(example):
+            return {"text": f"{example['instruction']}\n{example['output']}"}
+        ds = ds_raw.map(format_code, remove_columns=["instruction", "output"])
+        
+        dl = DataLoader(StreamingLanguageModelDataset(ds, SEQ_LEN, tokenizer), batch_size=1)
+        next(iter(dl))
+        print("OK: Evol-Instruct")
+        
     except Exception as e:
         print(f"FAILED: {e}")
 

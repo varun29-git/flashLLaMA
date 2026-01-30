@@ -97,7 +97,7 @@ def validate(model, dataset_name, device, steps=50):
     return avg_val_loss
 
 
-def train_cosmopedia(model, optimizer, scaler, vocab_size, global_tracker=None):
+def train_mixed_datasets(model, optimizer, scaler, vocab_size, global_tracker=None):
     device = next(model.parameters()).device
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     
@@ -111,21 +111,33 @@ def train_cosmopedia(model, optimizer, scaler, vocab_size, global_tracker=None):
 
     TOTAL_TOKENS = TOTAL_TRAINING_TOKENS
     print("\n" + "=" * 80)
-    print(f"STARTING TRAINING: Cosmopedia Only")
+    print(f"STARTING TRAINING: Mixed (Cosmo 50% | FW-Edu 30% | Code 20%)")
     print(f"Goal: {TOTAL_TOKENS:,} tokens")
     print("=" * 80)
     
-    # Initialize Dataset
-    print("\nLoading Cosmopedia (web_samples_v2)...")
+    # Initialize Datasets
+    print("\nLoading Datasets...")
+    # 1. Cosmopedia (50%)
     ds_cosmo = load_dataset("HuggingFaceTB/cosmopedia", "web_samples_v2", split="train", streaming=True)
-    dl_cosmo = DataLoader(
-        StreamingLanguageModelDataset(ds_cosmo, SEQ_LEN, tokenizer), 
-        batch_size=BATCH_SIZE, 
-        num_workers=4, 
-        pin_memory=True
-    )
+    dl_cosmo = DataLoader(StreamingLanguageModelDataset(ds_cosmo, SEQ_LEN, tokenizer), batch_size=BATCH_SIZE, num_workers=4, pin_memory=True)
+    
+    # 2. FineWeb-Edu (30%)
+    ds_fw = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True)
+    dl_fw = DataLoader(StreamingLanguageModelDataset(ds_fw, SEQ_LEN, tokenizer), batch_size=BATCH_SIZE, num_workers=4, pin_memory=True)
+    
+    # 3. Code (Evol-Instruct) (20%)
+    ds_code_raw = load_dataset("nickrosh/Evol-Instruct-Code-80k-v1", split="train", streaming=True)
+    
+    # Map function to format instruction+output into 'text'
+    def format_code(example):
+        return {"text": f"{example['instruction']}\n{example['output']}"}
+    
+    ds_code = ds_code_raw.map(format_code, remove_columns=["instruction", "output"])
+    dl_code = DataLoader(StreamingLanguageModelDataset(ds_code, SEQ_LEN, tokenizer), batch_size=BATCH_SIZE, num_workers=4, pin_memory=True)
 
     iter_cosmo = iter(dl_cosmo)
+    iter_fw = iter(dl_fw)
+    iter_code = iter(dl_code)
 
     # Progress Bar
     pbar = tqdm(total=TOTAL_TOKENS // (BATCH_SIZE * SEQ_LEN), dynamic_ncols=True)
@@ -145,11 +157,46 @@ def train_cosmopedia(model, optimizer, scaler, vocab_size, global_tracker=None):
         for param_group in optimizer.param_groups:
             param_group['lr'] = current_lr
 
+        # Weighted Sampling
+        r = random.random()
         try:
-            batch = next(iter_cosmo)
-        except StopIteration:
-            iter_cosmo = iter(dl_cosmo)
-            batch = next(iter_cosmo)
+            if r < 0.5:
+                # 50% Cosmopedia
+                try:
+                    batch = next(iter_cosmo)
+                    src = "Cosmo"
+                except StopIteration:
+                    iter_cosmo = iter(dl_cosmo)
+                    batch = next(iter_cosmo)
+                    src = "Cosmo"
+            elif r < 0.8:
+                # 30% FineWeb-Edu
+                try:
+                    batch = next(iter_fw)
+                    src = "FW-Edu"
+                except StopIteration:
+                    iter_fw = iter(dl_fw)
+                    batch = next(iter_fw)
+                    src = "FW-Edu"
+            else:
+                # 20% Code
+                try:
+                    batch = next(iter_code)
+                    src = "Code"
+                except StopIteration:
+                    iter_code = iter(dl_code)
+                    batch = next(iter_code)
+                    src = "Code"
+        except Exception as e:
+            # Fallback to Cosmo if specific iter fails unexpectedly
+            print(f"Warning: Batch loading failed for {r}. Fallback to Cosmo. Error: {e}")
+            try:
+                batch = next(iter_cosmo)
+                src = "Cosmo (FB)"
+            except StopIteration:
+                iter_cosmo = iter(dl_cosmo)
+                batch = next(iter_cosmo)
+                src = "Cosmo (FB)"
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         targets = batch["targets"].to(device, non_blocking=True)
@@ -185,6 +232,7 @@ def train_cosmopedia(model, optimizer, scaler, vocab_size, global_tracker=None):
         eta_str = f"{int(eta_seconds//3600)}h {int((eta_seconds%3600)//60)}m"
 
         pbar.set_postfix({
+            "Src": src,
             "LR": f"{current_lr:.1e}",
             "L": f"{avg_loss:.2f}",
             "ETA": eta_str
@@ -239,7 +287,7 @@ def train():
         'tokens_seen': 0
     }
 
-    train_cosmopedia(
+    train_mixed_datasets(
         model=model,
         optimizer=optimizer,
         scaler=scaler,
