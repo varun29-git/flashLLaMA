@@ -33,9 +33,17 @@ def verify():
         dl = DataLoader(StreamingLanguageModelDataset(ds, SEQ_LEN, "cl100k_base"), batch_size=1)
         batch = next(iter(dl))
         print("Successfully loaded one batch from Cosmopedia.")
-        print(f"Input shape: {batch['input_ids'].shape}")
     except Exception as e:
-        print(f"FAILED to load dataset: {e}")
+        print(f"FAILED to load Cosmopedia: {e}")
+
+    print("\nVerifying Dataset Loading (TinyStories)...")
+    try:
+        ds_ts = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+        dl_ts = DataLoader(StreamingLanguageModelDataset(ds_ts, SEQ_LEN, "cl100k_base"), batch_size=1)
+        batch_ts = next(iter(dl_ts))
+        print("Successfully loaded one batch from TinyStories.")
+    except Exception as e:
+        print(f"FAILED to load TinyStories: {e}")
 
 if __name__ == "__main__":
     verify()

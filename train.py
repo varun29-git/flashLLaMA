@@ -96,26 +96,30 @@ def validate(model, dataset_name, device, steps=50):
     return avg_val_loss
 
 
-def train_standard(model, optimizer, scaler, vocab_size, global_tracker=None):
+def train_mixed(model, optimizer, scaler, vocab_size, global_tracker=None):
     device = next(model.parameters()).device
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     
     # Configuration
     total_duration = TOTAL_TRAINING_TOKENS
     
-    phase_name = "Training: Cosmopedia (Unique Phase)"
+    phase_name = "Training: Mixed (Cosmo 90% | TS 10%)"
     print("\n" + "=" * 80)
     print(f"STARTING PHASE: {phase_name}")
     print(f"Duration: {total_duration:,} tokens")
     print("=" * 80)
 
     # Initialize Datasets
-    # Cosmopedia requires a config name. Using 'web_samples_v2' as general purpose subset.
+    # 1. Cosmopedia (Web Samples v2)
     ds_main = load_dataset("HuggingFaceTB/cosmopedia", "web_samples_v2", split="train", streaming=True)
+    # 2. TinyStories
+    ds_ts = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
 
     dl_main = DataLoader(StreamingLanguageModelDataset(ds_main, SEQ_LEN, "cl100k_base"), batch_size=BATCH_SIZE, num_workers=0)
+    dl_ts = DataLoader(StreamingLanguageModelDataset(ds_ts, SEQ_LEN, "cl100k_base"), batch_size=BATCH_SIZE, num_workers=0)
 
     iter_main = iter(dl_main)
+    iter_ts = iter(dl_ts)
 
     total_phase_tokens = 0
     
@@ -137,12 +141,21 @@ def train_standard(model, optimizer, scaler, vocab_size, global_tracker=None):
         for param_group in optimizer.param_groups:
             param_group['lr'] = current_lr
 
-        # Select Batch
+        # Select Batch (90% Cosmo, 10% TS)
+        use_ts = random.random() < 0.10
+        
         try:
-            batch = next(iter_main)
+            if use_ts:
+                batch = next(iter_ts)
+            else:
+                batch = next(iter_main)
         except StopIteration:
-            iter_main = iter(dl_main)
-            batch = next(iter_main)
+            if use_ts:
+                iter_ts = iter(dl_ts)
+                batch = next(iter_ts)
+            else:
+                iter_main = iter(dl_main)
+                batch = next(iter_main)
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         targets = batch["targets"].to(device, non_blocking=True)
@@ -181,14 +194,14 @@ def train_standard(model, optimizer, scaler, vocab_size, global_tracker=None):
              eta_str = f"{int(eta_seconds//3600)}h {int((eta_seconds%3600)//60)}m"
 
         pbar.set_postfix({
+            "TS": "10%" if use_ts else "0%",
             "LR": f"{current_lr:.1e}",
             "L": f"{avg_loss:.2f}",
             "ETA": eta_str
         })
 
     pbar.close()
-    print(f"Training Complete. Tokens: {total_phase_tokens:,}")
-    # validate(model, "HuggingFaceTB/cosmopedia", device) 
+    print(f"Training Complete. Tokens: {total_phase_tokens:,}") 
 
 
 def train():
@@ -207,13 +220,27 @@ def train():
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
     
     # Initialize Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LR,
-        weight_decay=0.1,
-        betas=(0.9, 0.95),
-        eps=1e-8
-    )
+    # Initialize Optimizer
+    optimizer = None
+    try:
+        import bitsandbytes as bnb
+        print("Using 8-bit AdamW optimizer via bitsandbytes...")
+        optimizer = bnb.optim.AdamW8bit(
+            model.parameters(),
+            lr=LR,
+            weight_decay=0.1,
+            betas=(0.9, 0.95),
+            eps=1e-8
+        )
+    except Exception as e:
+        print(f"Warning: bitsandbytes failed to load ({e}). Fallback to standard AdamW.")
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=LR,
+            weight_decay=0.1,
+            betas=(0.9, 0.95),
+            eps=1e-8
+        )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model Parameters: {n_params:,}")
@@ -224,7 +251,7 @@ def train():
         'tokens_seen': 0
     }
 
-    train_standard(
+    train_mixed(
         model=model,
         optimizer=optimizer,
         scaler=scaler,
