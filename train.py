@@ -212,7 +212,7 @@ def train():
             model.parameters(),
             lr=LR,
             weight_decay=0.1,
-            betas=(0.9, 0.95),
+            betas=(0.9, 0.99),
             eps=1e-8
         )
     except Exception as e:
@@ -221,7 +221,7 @@ def train():
             model.parameters(),
             lr=LR,
             weight_decay=0.1,
-            betas=(0.9, 0.95),
+            betas=(0.9, 0.99),
             eps=1e-8
         )
 
