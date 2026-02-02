@@ -185,7 +185,7 @@ def train_mixed_strategy(model, optimizer, scaler, vocab_size, global_tracker=No
     dl = DataLoader(
         StreamingLanguageModelDataset(mixed_dataset, SEQ_LEN, tokenizer), 
         batch_size=BATCH_SIZE, 
-        num_workers=4, 
+        num_workers=1, 
         pin_memory=True
     )
     iterator = iter(dl)

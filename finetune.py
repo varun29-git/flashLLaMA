@@ -17,7 +17,7 @@ from model import build_llama
 # Configuration
 # --------------------------------------------------------------------------------
 FT_LR = 3e-5
-FT_EPOCHS = 1 # One epoch is likely enough for 3-4 hours with streaming
+FT_EPOCHS = 1 
 FT_BATCH_SIZE = BATCH_SIZE
 FT_SEQ_LEN = 1024
 CHECKPOINT_PATH = f"{MODEL_FOLDER}/model_final.pt"
@@ -152,14 +152,14 @@ def train_finetune():
 
     Path(FINETUNE_MODEL_FOLDER).mkdir(parents=True, exist_ok=True)
 
-    # 1. Load Tokenizer
+    # Load Tokenizer
     try:
         tokenizer = Tokenizer.from_file("tokenizer.json")
     except Exception as e:
         print(f"Error loading tokenizer: {e}")
         return
 
-    # 2. Build Model
+    # Build Model
     vocab_size = tokenizer.get_vocab_size() # explicit check
     print(f"Building model (Vocab: {vocab_size})...")
     model = build_llama(
@@ -172,7 +172,7 @@ def train_finetune():
         dropout=DROPOUT
     ).to(device)
 
-    # 3. Load Checkpoint
+    # Load Checkpoint
     if Path(CHECKPOINT_PATH).exists():
         print(f"Loading pretrained weights from {CHECKPOINT_PATH}...")
         state_dict = torch.load(CHECKPOINT_PATH, map_location=device)
@@ -180,15 +180,18 @@ def train_finetune():
     else:
         print(f"WARNING: Checkpoint {CHECKPOINT_PATH} not found! Starting from scratch.")
 
-    # 4. Data
+    # Data
+    # Mixed Instruction Mix: SmolTalk (65%) | SlimOrca (20%) | TinyCodes (15%)
+    # Max tokens: 50k (dry run) -> 13 steps
+    train_dataset = MixedInstructionDataset(tokenizer, max_length=FT_SEQ_LEN, max_steps=13)
     train_loader = DataLoader(train_dataset, batch_size=FT_BATCH_SIZE, num_workers=1, pin_memory=True)
 
-    # 5. Optimizer
+    # Optimizer
     optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=FT_LR)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
-    # 6. Loop
+    # Loop
     model.train()
     print(f"Starting Fine-tuning (Mixed Strategy)...")
     
