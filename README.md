@@ -17,7 +17,7 @@ The implementation adheres to a Llama decoder-only design, incorporating several
   
 - Flash Attention Integration: The attention mechanism utilizes *`torch.nn.functional.scaled_dot_product_attention`*, which dispatches to fused FlashAttention-2 kernels. This minimizes GPU memory I/O by tiling the attention computation, significantly reducing memory overhead for longer sequences.
 
-- SwiGLU Activation: Employs a gated linear unit structure using SiLU activations ($x \cdot \sigma(x)$) in the feed-forward blocks for improved representational power.
+- SwiGLU Activation: Employs a gated linear unit structure using SiLU activations in the feed-forward blocks for improved representational power.
 - Weight Tying: The output projection layer shares the same weight matrix as the input embeddings, reducing total parameter count and improving training efficiency.
 
 The following diagram illustrates the data flow through the model
